@@ -70,6 +70,7 @@ def _setup_instagram_cookies() -> str | None:
         if csrftoken:
             lines.append(f".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\t{csrftoken}")
         content = "\n".join(lines) + "\n"
+        logger.info("Instagram cookies built from IG_SESSIONID + IG_DS_USER_ID env vars")
     else:
         # Fallback: try INSTAGRAM_COOKIES env var (small files only)
         raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
@@ -137,6 +138,9 @@ def _download_with_ytdlp(url: str, output_path: str) -> dict | None:
     # Pass Instagram cookies if available
     if _is_instagram(url) and _INSTAGRAM_COOKIES_PATH:
         ydl_opts["cookiefile"] = _INSTAGRAM_COOKIES_PATH
+        logger.info("Using Instagram cookies file for yt-dlp")
+    elif _is_instagram(url):
+        logger.warning("No Instagram cookies available - download may fail")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -182,64 +186,87 @@ def _download_tiktok_fallback(url: str, output_path: str) -> dict | None:
 
 
 def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
-    """Fallback for Instagram using third-party API."""
-    # Extract the shortcode from the Instagram URL
+    """Fallback for Instagram using direct GraphQL API with session cookies."""
     match = re.search(r"instagram\.com/(?:reel|p|stories)/([A-Za-z0-9_-]+)", url)
     if not match:
         logger.error("Could not extract Instagram shortcode from URL")
         return None
 
     shortcode = match.group(1)
-    api_url = f"https://api.saveinsta.cam/media?url={urllib.parse.quote(url, safe='')}"
 
-    req = urllib.request.Request(
-        api_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json",
-        },
+    # We need the session cookies
+    sessionid = os.getenv("IG_SESSIONID", "").strip()
+    ds_user_id = os.getenv("IG_DS_USER_ID", "").strip()
+    csrftoken = os.getenv("IG_CSRFTOKEN", "").strip()
+
+    if not sessionid or not ds_user_id:
+        logger.error("Instagram fallback requires IG_SESSIONID and IG_DS_USER_ID env vars")
+        return None
+
+    cookie_str = f"sessionid={sessionid}; ds_user_id={ds_user_id}"
+    if csrftoken:
+        cookie_str += f"; csrftoken={csrftoken}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": cookie_str,
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if csrftoken:
+        headers["X-CSRFToken"] = csrftoken
+
+    # Try Instagram GraphQL API to get media info
+    graphql_url = (
+        "https://www.instagram.com/graphql/query/"
+        f"?query_hash=b3055c01b4b222b8a47dc12b090e4e64"
+        f"&variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
     )
+
+    req = urllib.request.Request(graphql_url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-    except Exception:
-        # Try alternative API
-        alt_api_url = f"https://v3.igdownloader.app/api/v1/instagram?url={urllib.parse.quote(url, safe='')}"
-        alt_req = urllib.request.Request(
-            alt_api_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(alt_req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+        media = data["data"]["shortcode_media"]
+        video_url = media.get("video_url")
+        title = media.get("edge_media_to_caption", {}).get("edges", [{}])
+        if title:
+            title = title[0].get("node", {}).get("text", "")
+        else:
+            title = ""
+    except Exception as e:
+        logger.warning("Instagram GraphQL failed: %s, trying page scrape...", e)
+        # Fallback: fetch the post page and extract video_url from page source
+        page_url = f"https://www.instagram.com/p/{shortcode}/"
+        req2 = urllib.request.Request(page_url, headers=headers)
+        with urllib.request.urlopen(req2, timeout=30) as resp2:
+            html = resp2.read().decode("utf-8", errors="replace")
 
-    # Try to find a video URL in the response
-    video_url = None
-    if isinstance(data, dict):
-        for key in ("video", "url", "download_url", "media", "link"):
-            if key in data and isinstance(data[key], str) and data[key].startswith("http"):
-                video_url = data[key]
-                break
-        # Check nested structures
-        if not video_url and "data" in data:
-            inner = data["data"]
-            if isinstance(inner, list) and inner:
-                inner = inner[0]
-            if isinstance(inner, dict):
-                for key in ("video", "url", "download_url", "media", "link"):
-                    if key in inner and isinstance(inner[key], str) and inner[key].startswith("http"):
-                        video_url = inner[key]
-                        break
+        # Try to find video_url in the page HTML
+        vid_match = re.search(r'"video_url"\s*:\s*"([^"]+)"', html)
+        if not vid_match:
+            logger.error("Could not find video_url in Instagram page")
+            return None
+        video_url = vid_match.group(1).replace("\\u0026", "&")
+        title = ""
 
     if not video_url:
-        logger.error("Instagram fallback API returned no video URL: %s", data)
+        logger.error("Instagram media has no video_url (might be a photo)")
         return None
 
+    logger.info("Instagram fallback: downloading video from direct URL")
     vid_req = urllib.request.Request(
         video_url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        headers={
+            "User-Agent": headers["User-Agent"],
+            "Cookie": cookie_str,
+        },
     )
     with urllib.request.urlopen(vid_req, timeout=60) as vid_resp:
         with open(output_path, "wb") as f:
@@ -249,7 +276,7 @@ def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
                     break
                 f.write(chunk)
 
-    return {"title": f"Instagram {shortcode}"}
+    return {"title": title or f"Instagram {shortcode}"}
 
 
 def download_video(url: str, output_path: str) -> dict | None:
