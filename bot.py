@@ -185,8 +185,17 @@ def _download_tiktok_fallback(url: str, output_path: str) -> dict | None:
     return {"title": video_data.get("title", "")}
 
 
+def _shortcode_to_media_id(shortcode: str) -> int:
+    """Convert Instagram shortcode to numeric media ID."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    media_id = 0
+    for char in shortcode:
+        media_id = media_id * 64 + alphabet.index(char)
+    return media_id
+
+
 def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
-    """Fallback for Instagram using direct GraphQL API with session cookies."""
+    """Fallback for Instagram using direct API with session cookies."""
     match = re.search(r"instagram\.com/(?:reel|p|stories)/([A-Za-z0-9_-]+)", url)
     if not match:
         logger.error("Could not extract Instagram shortcode from URL")
@@ -194,7 +203,6 @@ def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
 
     shortcode = match.group(1)
 
-    # We need the session cookies
     sessionid = os.getenv("IG_SESSIONID", "").strip()
     ds_user_id = os.getenv("IG_DS_USER_ID", "").strip()
     csrftoken = os.getenv("IG_CSRFTOKEN", "").strip()
@@ -208,59 +216,111 @@ def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
         cookie_str += f"; csrftoken={csrftoken}"
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Instagram 275.0.0.27.98 Android",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Cookie": cookie_str,
         "X-IG-App-ID": "936619743392459",
-        "X-Requested-With": "XMLHttpRequest",
     }
     if csrftoken:
         headers["X-CSRFToken"] = csrftoken
 
-    # Try Instagram GraphQL API to get media info
-    graphql_url = (
-        "https://www.instagram.com/graphql/query/"
-        f"?query_hash=b3055c01b4b222b8a47dc12b090e4e64"
-        f"&variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
-    )
+    video_url = None
+    title = ""
 
-    req = urllib.request.Request(graphql_url, headers=headers)
+    # --- Method 1: Instagram mobile API (i.instagram.com) ---
     try:
+        media_id = _shortcode_to_media_id(shortcode)
+        api_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
+        logger.info("Instagram fallback: trying mobile API for media %s", media_id)
+        req = urllib.request.Request(api_url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-        media = data["data"]["shortcode_media"]
-        video_url = media.get("video_url")
-        title = media.get("edge_media_to_caption", {}).get("edges", [{}])
-        if title:
-            title = title[0].get("node", {}).get("text", "")
-        else:
-            title = ""
-    except Exception as e:
-        logger.warning("Instagram GraphQL failed: %s, trying page scrape...", e)
-        # Fallback: fetch the post page and extract video_url from page source
-        page_url = f"https://www.instagram.com/p/{shortcode}/"
-        req2 = urllib.request.Request(page_url, headers=headers)
-        with urllib.request.urlopen(req2, timeout=30) as resp2:
-            html = resp2.read().decode("utf-8", errors="replace")
 
-        # Try to find video_url in the page HTML
-        vid_match = re.search(r'"video_url"\s*:\s*"([^"]+)"', html)
-        if not vid_match:
-            logger.error("Could not find video_url in Instagram page")
-            return None
-        video_url = vid_match.group(1).replace("\\u0026", "&")
-        title = ""
+        items = data.get("items", [])
+        if items:
+            item = items[0]
+            # Get video URL from video_versions
+            versions = item.get("video_versions", [])
+            if versions:
+                video_url = versions[0].get("url")
+            # Get caption
+            caption = item.get("caption")
+            if caption and isinstance(caption, dict):
+                title = caption.get("text", "")
+    except Exception as e:
+        logger.warning("Instagram mobile API failed: %s", e)
+
+    # --- Method 2: web JSON endpoint ---
+    if not video_url:
+        try:
+            json_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+            logger.info("Instagram fallback: trying web JSON endpoint")
+            web_headers = dict(headers)
+            web_headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
+            req2 = urllib.request.Request(json_url, headers=web_headers)
+            with urllib.request.urlopen(req2, timeout=30) as resp2:
+                raw = resp2.read().decode("utf-8", errors="replace")
+                data2 = json.loads(raw)
+
+            # Navigate the response structure
+            media = None
+            if "graphql" in data2:
+                media = data2["graphql"].get("shortcode_media")
+            elif "items" in data2:
+                media = data2["items"][0] if data2["items"] else None
+
+            if media:
+                video_url = media.get("video_url")
+                if not video_url:
+                    versions = media.get("video_versions", [])
+                    if versions:
+                        video_url = versions[0].get("url")
+                edges = media.get("edge_media_to_caption", {}).get("edges", [])
+                if edges:
+                    title = edges[0].get("node", {}).get("text", "")
+        except Exception as e:
+            logger.warning("Instagram web JSON endpoint failed: %s", e)
+
+    # --- Method 3: page scrape ---
+    if not video_url:
+        try:
+            page_url = f"https://www.instagram.com/p/{shortcode}/"
+            logger.info("Instagram fallback: trying page scrape")
+            web_headers = dict(headers)
+            web_headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
+            req3 = urllib.request.Request(page_url, headers=web_headers)
+            with urllib.request.urlopen(req3, timeout=30) as resp3:
+                html = resp3.read().decode("utf-8", errors="replace")
+
+            for pattern in [
+                r'"video_url"\s*:\s*"([^"]+)"',
+                r'"contentUrl"\s*:\s*"([^"]+)"',
+                r'"video_url":"([^"]+)"',
+                r'<meta\s+property="og:video"\s+content="([^"]+)"',
+                r'<meta\s+content="([^"]+)"\s+property="og:video"',
+            ]:
+                vid_match = re.search(pattern, html)
+                if vid_match:
+                    video_url = vid_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                    logger.info("Instagram fallback: found video URL via page scrape")
+                    break
+        except Exception as e:
+            logger.warning("Instagram page scrape failed: %s", e)
 
     if not video_url:
-        logger.error("Instagram media has no video_url (might be a photo)")
+        logger.error("Instagram: no video found (might be a photo post)")
         return None
 
-    logger.info("Instagram fallback: downloading video from direct URL")
+    logger.info("Instagram fallback: downloading video...")
     vid_req = urllib.request.Request(
         video_url,
         headers={
