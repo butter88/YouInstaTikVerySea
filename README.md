@@ -25,7 +25,14 @@ pip install -r requirements.txt
 #    Edita el archivo .env y pon tu token:
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 
-# 4. Ejecutar el bot
+# 4. (Opcional) Cookies de Instagram para evitar rate-limit
+#    Exporta tus cookies de Instagram en formato Netscape (usa la extension
+#    "Get cookies.txt LOCALLY" en Chrome), luego codifícalas en base64:
+#      base64 -w0 cookies.txt
+#    Pega el resultado en .env:
+INSTAGRAM_COOKIES=<base64 del archivo cookies.txt>
+
+# 5. Ejecutar el bot
 python bot.py
 ```
 
@@ -39,3 +46,4 @@ python bot.py
 
 - Telegram limita el envio de archivos a **50 MB**. Videos mas grandes no se podran enviar.
 - El bot usa `yt-dlp` que se actualiza frecuentemente. Si deja de funcionar, actualiza: `pip install -U yt-dlp`.
+- Para Instagram, si el bot está en un servidor cloud, necesitarás configurar `INSTAGRAM_COOKIES` con las cookies de una sesión de Instagram para evitar bloqueos por rate-limit.

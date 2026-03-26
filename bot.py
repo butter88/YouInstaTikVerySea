@@ -4,6 +4,7 @@ import json
 import logging
 import tempfile
 import asyncio
+import base64
 import urllib.request
 import urllib.parse
 
@@ -41,6 +42,32 @@ ANY_SUPPORTED_URL = re.compile(
 
 MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
+# --- Instagram cookies setup ---
+_INSTAGRAM_COOKIES_PATH = None
+
+
+def _setup_instagram_cookies() -> str | None:
+    """Write Instagram cookies from env var to a temp file for yt-dlp."""
+    raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
+    if not raw:
+        return None
+    try:
+        # Support both base64-encoded and plain text cookies
+        try:
+            content = base64.b64decode(raw).decode("utf-8")
+        except Exception:
+            content = raw  # Already plain text Netscape format
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix="ig_cookies_", delete=False
+        )
+        tmp.write(content)
+        tmp.close()
+        logger.info("Instagram cookies loaded from env var (%d bytes)", len(content))
+        return tmp.name
+    except Exception as e:
+        logger.error("Failed to setup Instagram cookies: %s", e)
+        return None
+
 
 def extract_supported_url(text: str) -> str | None:
     """Extract the first supported URL (TikTok/Instagram/YouTube) from text."""
@@ -55,6 +82,10 @@ def is_supported_url(url: str) -> bool:
 
 def _is_tiktok(url: str) -> bool:
     return "tiktok.com" in url
+
+
+def _is_instagram(url: str) -> bool:
+    return "instagram.com" in url
 
 
 def _download_with_ytdlp(url: str, output_path: str) -> dict | None:
@@ -78,6 +109,11 @@ def _download_with_ytdlp(url: str, output_path: str) -> dict | None:
         },
         "extractor_args": {"tiktok": {"api_hostname": ["api22-normal-c-alisg.tiktokv.com"]}},
     }
+
+    # Pass Instagram cookies if available
+    if _is_instagram(url) and _INSTAGRAM_COOKIES_PATH:
+        ydl_opts["cookiefile"] = _INSTAGRAM_COOKIES_PATH
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return info
@@ -121,6 +157,77 @@ def _download_tiktok_fallback(url: str, output_path: str) -> dict | None:
     return {"title": video_data.get("title", "")}
 
 
+def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
+    """Fallback for Instagram using third-party API."""
+    # Extract the shortcode from the Instagram URL
+    match = re.search(r"instagram\.com/(?:reel|p|stories)/([A-Za-z0-9_-]+)", url)
+    if not match:
+        logger.error("Could not extract Instagram shortcode from URL")
+        return None
+
+    shortcode = match.group(1)
+    api_url = f"https://api.saveinsta.cam/media?url={urllib.parse.quote(url, safe='')}"
+
+    req = urllib.request.Request(
+        api_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        # Try alternative API
+        alt_api_url = f"https://v3.igdownloader.app/api/v1/instagram?url={urllib.parse.quote(url, safe='')}"
+        alt_req = urllib.request.Request(
+            alt_api_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(alt_req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+
+    # Try to find a video URL in the response
+    video_url = None
+    if isinstance(data, dict):
+        for key in ("video", "url", "download_url", "media", "link"):
+            if key in data and isinstance(data[key], str) and data[key].startswith("http"):
+                video_url = data[key]
+                break
+        # Check nested structures
+        if not video_url and "data" in data:
+            inner = data["data"]
+            if isinstance(inner, list) and inner:
+                inner = inner[0]
+            if isinstance(inner, dict):
+                for key in ("video", "url", "download_url", "media", "link"):
+                    if key in inner and isinstance(inner[key], str) and inner[key].startswith("http"):
+                        video_url = inner[key]
+                        break
+
+    if not video_url:
+        logger.error("Instagram fallback API returned no video URL: %s", data)
+        return None
+
+    vid_req = urllib.request.Request(
+        video_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+    )
+    with urllib.request.urlopen(vid_req, timeout=60) as vid_resp:
+        with open(output_path, "wb") as f:
+            while True:
+                chunk = vid_resp.read(1024 * 64)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+    return {"title": f"Instagram {shortcode}"}
+
+
 def download_video(url: str, output_path: str) -> dict | None:
     """Download video from TikTok, Instagram, or YouTube."""
     # --- Attempt 1: yt-dlp (universal) ---
@@ -137,6 +244,13 @@ def download_video(url: str, output_path: str) -> dict | None:
             return _download_tiktok_fallback(url, output_path)
         except Exception as e:
             logger.error("TikTok fallback also failed: %s", e)
+
+    # --- Attempt 3: Instagram-specific fallback ---
+    if _is_instagram(url):
+        try:
+            return _download_instagram_fallback(url, output_path)
+        except Exception as e:
+            logger.error("Instagram fallback also failed: %s", e)
 
     return None
 
@@ -271,6 +385,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
+    global _INSTAGRAM_COOKIES_PATH
+    _INSTAGRAM_COOKIES_PATH = _setup_instagram_cookies()
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en .env")
