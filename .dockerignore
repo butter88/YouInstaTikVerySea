@@ -1,0 +1,8 @@
+.env
+.env.example
+.git
+.gitignore
+__pycache__
+*.pyc
+*.mp4
+README.md
