@@ -9,7 +9,7 @@ import urllib.request
 import urllib.parse
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import yt_dlp
 
@@ -195,7 +195,10 @@ def _shortcode_to_media_id(shortcode: str) -> int:
 
 
 def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
-    """Fallback for Instagram using direct API with session cookies."""
+    """Fallback for Instagram using direct API with session cookies.
+    Supports videos, single images, and carousels.
+    Returns dict with 'title', and optionally 'image_urls' for photo posts.
+    """
     match = re.search(r"instagram\.com/(?:reel|p|stories)/([A-Za-z0-9_-]+)", url)
     if not match:
         logger.error("Could not extract Instagram shortcode from URL")
@@ -226,6 +229,7 @@ def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
         headers["X-CSRFToken"] = csrftoken
 
     video_url = None
+    image_urls = []
     title = ""
 
     # --- Method 1: Instagram mobile API (i.instagram.com) ---
@@ -240,54 +244,39 @@ def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
         items = data.get("items", [])
         if items:
             item = items[0]
-            # Get video URL from video_versions
-            versions = item.get("video_versions", [])
-            if versions:
-                video_url = versions[0].get("url")
             # Get caption
             caption = item.get("caption")
             if caption and isinstance(caption, dict):
                 title = caption.get("text", "")
+
+            # Check for carousel
+            carousel = item.get("carousel_media", [])
+            if carousel:
+                logger.info("Instagram fallback: detected carousel with %d items", len(carousel))
+                for slide in carousel:
+                    # Each slide can be video or image
+                    vid_versions = slide.get("video_versions", [])
+                    if vid_versions:
+                        image_urls.append(vid_versions[0]["url"])
+                    else:
+                        # Get best quality image
+                        candidates = slide.get("image_versions2", {}).get("candidates", [])
+                        if candidates:
+                            image_urls.append(candidates[0]["url"])
+            else:
+                # Single post - check video first, then image
+                versions = item.get("video_versions", [])
+                if versions:
+                    video_url = versions[0].get("url")
+                else:
+                    candidates = item.get("image_versions2", {}).get("candidates", [])
+                    if candidates:
+                        image_urls.append(candidates[0]["url"])
     except Exception as e:
         logger.warning("Instagram mobile API failed: %s", e)
 
-    # --- Method 2: web JSON endpoint ---
-    if not video_url:
-        try:
-            json_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
-            logger.info("Instagram fallback: trying web JSON endpoint")
-            web_headers = dict(headers)
-            web_headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
-            req2 = urllib.request.Request(json_url, headers=web_headers)
-            with urllib.request.urlopen(req2, timeout=30) as resp2:
-                raw = resp2.read().decode("utf-8", errors="replace")
-                data2 = json.loads(raw)
-
-            # Navigate the response structure
-            media = None
-            if "graphql" in data2:
-                media = data2["graphql"].get("shortcode_media")
-            elif "items" in data2:
-                media = data2["items"][0] if data2["items"] else None
-
-            if media:
-                video_url = media.get("video_url")
-                if not video_url:
-                    versions = media.get("video_versions", [])
-                    if versions:
-                        video_url = versions[0].get("url")
-                edges = media.get("edge_media_to_caption", {}).get("edges", [])
-                if edges:
-                    title = edges[0].get("node", {}).get("text", "")
-        except Exception as e:
-            logger.warning("Instagram web JSON endpoint failed: %s", e)
-
-    # --- Method 3: page scrape ---
-    if not video_url:
+    # --- Method 2: page scrape (for video only) ---
+    if not video_url and not image_urls:
         try:
             page_url = f"https://www.instagram.com/p/{shortcode}/"
             logger.info("Instagram fallback: trying page scrape")
@@ -301,23 +290,35 @@ def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
             with urllib.request.urlopen(req3, timeout=30) as resp3:
                 html = resp3.read().decode("utf-8", errors="replace")
 
+            # Try video patterns
             for pattern in [
                 r'"video_url"\s*:\s*"([^"]+)"',
                 r'"contentUrl"\s*:\s*"([^"]+)"',
-                r'"video_url":"([^"]+)"',
                 r'<meta\s+property="og:video"\s+content="([^"]+)"',
-                r'<meta\s+content="([^"]+)"\s+property="og:video"',
             ]:
                 vid_match = re.search(pattern, html)
                 if vid_match:
                     video_url = vid_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
                     logger.info("Instagram fallback: found video URL via page scrape")
                     break
+
+            # If no video, try og:image as last resort
+            if not video_url:
+                img_match = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
+                if img_match:
+                    image_urls.append(img_match.group(1).replace("\\u0026", "&").replace("\\/", "/"))
+                    logger.info("Instagram fallback: found image URL via og:image")
         except Exception as e:
             logger.warning("Instagram page scrape failed: %s", e)
 
+    # --- Return images (carousel/single photo) ---
+    if image_urls and not video_url:
+        logger.info("Instagram fallback: returning %d image(s)", len(image_urls))
+        return {"title": title or f"Instagram {shortcode}", "image_urls": image_urls}
+
+    # --- Download video ---
     if not video_url:
-        logger.error("Instagram: no video found (might be a photo post)")
+        logger.error("Instagram: no media found for %s", shortcode)
         return None
 
     logger.info("Instagram fallback: downloading video...")
@@ -359,11 +360,76 @@ def download_video(url: str, output_path: str) -> dict | None:
     # --- Attempt 3: Instagram-specific fallback ---
     if _is_instagram(url):
         try:
-            return _download_instagram_fallback(url, output_path)
+            result = _download_instagram_fallback(url, output_path)
+            if result:
+                return result
         except Exception as e:
             logger.error("Instagram fallback also failed: %s", e)
 
     return None
+
+
+async def _send_media(update: Update, status_msg, info: dict | None, output_path: str) -> bool:
+    """Send downloaded media (video file or Instagram images). Returns True on success."""
+    if not info:
+        return False
+
+    caption = info.get("title", "")
+    if len(caption) > 1024:
+        caption = caption[:1021] + "..."
+
+    # --- Instagram images (carousel or single photo) ---
+    image_urls = info.get("image_urls", [])
+    if image_urls:
+        try:
+            if len(image_urls) == 1:
+                await update.message.reply_photo(
+                    photo=image_urls[0],
+                    caption=caption,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            else:
+                # Send as media group (max 10 per group in Telegram)
+                for i in range(0, len(image_urls), 10):
+                    batch = image_urls[i:i + 10]
+                    media_group = []
+                    for j, img_url in enumerate(batch):
+                        media_group.append(InputMediaPhoto(
+                            media=img_url,
+                            caption=caption if (i == 0 and j == 0) else "",
+                        ))
+                    await update.message.reply_media_group(
+                        media=media_group,
+                        read_timeout=120,
+                        write_timeout=120,
+                    )
+            await status_msg.delete()
+            return True
+        except Exception as e:
+            logger.error("Error sending Instagram images: %s", e)
+            return False
+
+    # --- Video file ---
+    if not os.path.exists(output_path):
+        return False
+
+    file_size = os.path.getsize(output_path)
+    if file_size > MAX_TELEGRAM_FILE_SIZE:
+        await status_msg.edit_text(
+            "El video es demasiado grande para enviarlo por Telegram (max 50 MB)."
+        )
+        return True  # handled, don't show generic error
+
+    with open(output_path, "rb") as video_file:
+        await update.message.reply_video(
+            video=video_file,
+            caption=caption,
+            read_timeout=120,
+            write_timeout=120,
+        )
+    await status_msg.delete()
+    return True
 
 
 async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,36 +458,14 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         info = download_video(url, output_path)
-
-        if not os.path.exists(output_path):
-            await status_msg.edit_text("No se pudo descargar el video.")
-            return
-
-        file_size = os.path.getsize(output_path)
-        if file_size > MAX_TELEGRAM_FILE_SIZE:
-            await status_msg.edit_text(
-                "El video es demasiado grande para enviarlo por Telegram (max 50 MB)."
-            )
-            return
-
-        caption = info.get("title", "") if info else ""
-        if len(caption) > 1024:
-            caption = caption[:1021] + "..."
-
-        with open(output_path, "rb") as video_file:
-            await update.message.reply_video(
-                video=video_file,
-                caption=caption,
-                read_timeout=120,
-                write_timeout=120,
-            )
-
-        await status_msg.delete()
+        sent = await _send_media(update, status_msg, info, output_path)
+        if not sent:
+            await status_msg.edit_text("No se pudo descargar el contenido.")
 
     except Exception as e:
-        logger.error("Error descargando video: %s", e)
+        logger.error("Error descargando: %s", e)
         await status_msg.edit_text(
-            "Error al descargar el video. Comprueba que el enlace sea valido."
+            "Error al descargar. Comprueba que el enlace sea valido."
         )
     finally:
         if os.path.exists(output_path):
@@ -446,36 +490,14 @@ async def auto_detect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         info = download_video(url, output_path)
-
-        if not os.path.exists(output_path):
-            await status_msg.edit_text("No se pudo descargar el video.")
-            return
-
-        file_size = os.path.getsize(output_path)
-        if file_size > MAX_TELEGRAM_FILE_SIZE:
-            await status_msg.edit_text(
-                "El video es demasiado grande para enviarlo por Telegram (max 50 MB)."
-            )
-            return
-
-        caption = info.get("title", "") if info else ""
-        if len(caption) > 1024:
-            caption = caption[:1021] + "..."
-
-        with open(output_path, "rb") as video_file:
-            await update.message.reply_video(
-                video=video_file,
-                caption=caption,
-                read_timeout=120,
-                write_timeout=120,
-            )
-
-        await status_msg.delete()
+        sent = await _send_media(update, status_msg, info, output_path)
+        if not sent:
+            await status_msg.edit_text("No se pudo descargar el contenido.")
 
     except Exception as e:
-        logger.error("Error descargando video: %s", e)
+        logger.error("Error descargando: %s", e)
         await status_msg.edit_text(
-            "Error al descargar el video. Comprueba que el enlace sea valido."
+            "Error al descargar. Comprueba que el enlace sea valido."
         )
     finally:
         if os.path.exists(output_path):
