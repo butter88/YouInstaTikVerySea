@@ -47,22 +47,46 @@ _INSTAGRAM_COOKIES_PATH = None
 
 
 def _setup_instagram_cookies() -> str | None:
-    """Write Instagram cookies from env var to a temp file for yt-dlp."""
-    raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
-    if not raw:
-        return None
-    try:
-        # Support both base64-encoded and plain text cookies
+    """Build a Netscape cookies file from individual Instagram cookie env vars.
+
+    Required env vars (get from browser DevTools > Application > Cookies > instagram.com):
+      - IG_SESSIONID   → sessionid cookie
+      - IG_DS_USER_ID  → ds_user_id cookie
+      - IG_CSRFTOKEN   → csrftoken cookie
+
+    Alternatively, supports legacy INSTAGRAM_COOKIES (small base64/plain text).
+    """
+    sessionid = os.getenv("IG_SESSIONID", "").strip()
+    ds_user_id = os.getenv("IG_DS_USER_ID", "").strip()
+    csrftoken = os.getenv("IG_CSRFTOKEN", "").strip()
+
+    if sessionid and ds_user_id:
+        # Build minimal Netscape format cookies file
+        lines = [
+            "# Netscape HTTP Cookie File",
+            f".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t{sessionid}",
+            f".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t{ds_user_id}",
+        ]
+        if csrftoken:
+            lines.append(f".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\t{csrftoken}")
+        content = "\n".join(lines) + "\n"
+    else:
+        # Fallback: try INSTAGRAM_COOKIES env var (small files only)
+        raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
+        if not raw:
+            return None
         try:
             content = base64.b64decode(raw).decode("utf-8")
         except Exception:
-            content = raw  # Already plain text Netscape format
+            content = raw
+
+    try:
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", prefix="ig_cookies_", delete=False
         )
         tmp.write(content)
         tmp.close()
-        logger.info("Instagram cookies loaded from env var (%d bytes)", len(content))
+        logger.info("Instagram cookies loaded (%d bytes)", len(content))
         return tmp.name
     except Exception as e:
         logger.error("Failed to setup Instagram cookies: %s", e)
