@@ -171,6 +171,62 @@ def _generate_thumbnail(video_path: str) -> str | None:
     return None
 
 
+def _compress_video(input_path: str, target_size_mb: float = 49.0) -> str | None:
+    """Re-encode video with ffmpeg to fit under target size."""
+    output_path = input_path + ".compressed.mp4"
+    try:
+        # Get video duration
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+            capture_output=True, text=True, timeout=15,
+        )
+        duration = float(probe.stdout.strip())
+        if duration <= 0:
+            return None
+
+        # Calculate target bitrate (bits/s). Reserve 128kbps for audio.
+        target_bits = target_size_mb * 8 * 1024 * 1024
+        audio_bitrate = 128_000
+        video_bitrate = int(target_bits / duration - audio_bitrate)
+        if video_bitrate < 200_000:  # Less than 200kbps = unwatchable
+            logger.warning("Video too long to compress under %sMB (would need %dkbps)",
+                           target_size_mb, video_bitrate // 1000)
+            return None
+
+        logger.info("Compressing video: duration=%.1fs, target_vbitrate=%dkbps",
+                     duration, video_bitrate // 1000)
+
+        subprocess.run(
+            [
+                "ffmpeg", "-i", input_path,
+                "-c:v", "libx264", "-preset", "fast",
+                "-b:v", str(video_bitrate),
+                "-maxrate", str(int(video_bitrate * 1.5)),
+                "-bufsize", str(int(video_bitrate * 2)),
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-y", output_path,
+            ],
+            capture_output=True, timeout=300,
+        )
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            final_size = os.path.getsize(output_path)
+            logger.info("Compressed: %dMB -> %dMB",
+                        os.path.getsize(input_path) // (1024*1024),
+                        final_size // (1024*1024))
+            if final_size <= MAX_TELEGRAM_FILE_SIZE:
+                return output_path
+            logger.warning("Compressed file still too large: %dMB", final_size // (1024*1024))
+    except Exception as e:
+        logger.error("Video compression failed: %s", e)
+
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    return None
+
+
 def _download_tiktok_fallback(url: str, output_path: str) -> dict | None:
     """Fallback for TikTok using tikwm.com API."""
     api_url = "https://www.tikwm.com/api/?url=" + urllib.parse.quote(url, safe="")
@@ -439,19 +495,26 @@ async def _send_media(update: Update, status_msg, info: dict | None, output_path
         return False
 
     file_size = os.path.getsize(output_path)
+    actual_path = output_path
+    compressed_path = None
+
     if file_size > MAX_TELEGRAM_FILE_SIZE:
-        await status_msg.edit_text(
-            "El video es demasiado grande para enviarlo por Telegram (max 50 MB)."
-        )
-        return True  # handled, don't show generic error
+        await status_msg.edit_text("Video demasiado grande, comprimiendo...")
+        compressed_path = _compress_video(output_path)
+        if not compressed_path:
+            await status_msg.edit_text(
+                "El video es demasiado grande y no se pudo comprimir (max 50 MB)."
+            )
+            return True
+        actual_path = compressed_path
 
     # Generate thumbnail so Telegram shows a preview instead of black
-    thumb_path = _generate_thumbnail(output_path)
+    thumb_path = _generate_thumbnail(actual_path)
     thumb_file = None
     try:
         if thumb_path:
             thumb_file = open(thumb_path, "rb")
-        with open(output_path, "rb") as video_file:
+        with open(actual_path, "rb") as video_file:
             await update.message.reply_video(
                 video=video_file,
                 thumbnail=thumb_file,
@@ -464,6 +527,8 @@ async def _send_media(update: Update, status_msg, info: dict | None, output_path
             thumb_file.close()
         if thumb_path and os.path.exists(thumb_path):
             os.remove(thumb_path)
+        if compressed_path and os.path.exists(compressed_path):
+            os.remove(compressed_path)
     await status_msg.delete()
     return True
 
