@@ -5,6 +5,7 @@ import logging
 import tempfile
 import asyncio
 import base64
+import subprocess
 import urllib.request
 import urllib.parse
 
@@ -29,6 +30,8 @@ SUPPORTED_PATTERNS = [
     # YouTube (normal, shorts, youtu.be)
     re.compile(r"https?://(?:www\.)?youtube\.com/(?:watch|shorts)\S+"),
     re.compile(r"https?://youtu\.be/\S+"),
+    # Twitter / X
+    re.compile(r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+/status/\S+"),
 ]
 
 ANY_SUPPORTED_URL = re.compile(
@@ -37,6 +40,7 @@ ANY_SUPPORTED_URL = re.compile(
     r"|(?:www\.)?instagram\.com/(?:reel|p|stories)/\S+"
     r"|(?:www\.)?youtube\.com/(?:watch|shorts)[?/]\S+"
     r"|youtu\.be/\S+"
+    r"|(?:www\.)?(?:twitter\.com|x\.com)/\S+/status/\S+"
     r")"
 )
 
@@ -145,6 +149,26 @@ def _download_with_ytdlp(url: str, output_path: str) -> dict | None:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return info
+
+
+def _generate_thumbnail(video_path: str) -> str | None:
+    """Extract a thumbnail from the video using ffmpeg."""
+    thumb_path = video_path + ".thumb.jpg"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-i", video_path,
+                "-ss", "00:00:01", "-vframes", "1",
+                "-vf", "scale=320:-1",
+                "-q:v", "5", thumb_path,
+            ],
+            capture_output=True, timeout=15,
+        )
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
+    except Exception as e:
+        logger.warning("Thumbnail generation failed: %s", e)
+    return None
 
 
 def _download_tiktok_fallback(url: str, output_path: str) -> dict | None:
@@ -421,13 +445,25 @@ async def _send_media(update: Update, status_msg, info: dict | None, output_path
         )
         return True  # handled, don't show generic error
 
-    with open(output_path, "rb") as video_file:
-        await update.message.reply_video(
-            video=video_file,
-            caption=caption,
-            read_timeout=120,
-            write_timeout=120,
-        )
+    # Generate thumbnail so Telegram shows a preview instead of black
+    thumb_path = _generate_thumbnail(output_path)
+    thumb_file = None
+    try:
+        if thumb_path:
+            thumb_file = open(thumb_path, "rb")
+        with open(output_path, "rb") as video_file:
+            await update.message.reply_video(
+                video=video_file,
+                thumbnail=thumb_file,
+                caption=caption,
+                read_timeout=120,
+                write_timeout=120,
+            )
+    finally:
+        if thumb_file:
+            thumb_file.close()
+        if thumb_path and os.path.exists(thumb_path):
+            os.remove(thumb_path)
     await status_msg.delete()
     return True
 
@@ -447,7 +483,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     url = context.args[0]
     if not is_supported_url(url):
         await update.message.reply_text(
-            "Enlace no soportado. Usa enlaces de TikTok, Instagram o YouTube."
+            "Enlace no soportado. Usa enlaces de TikTok, Instagram, YouTube o Twitter/X."
         )
         return
 
@@ -512,7 +548,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Plataformas soportadas:\n"
         "- TikTok\n"
         "- Instagram (Reels/Posts)\n"
-        "- YouTube (Videos/Shorts)\n\n"
+        "- YouTube (Videos/Shorts)\n"
+        "- Twitter/X (Videos)\n\n"
         "Tambien puedes simplemente pegar un enlace y lo detectare automaticamente."
     )
 
@@ -529,7 +566,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("video", cmd_video))
-    # Auto-detect TikTok/Instagram/YouTube links in any text message
+    # Auto-detect TikTok/Instagram/YouTube/Twitter links in any text message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect))
 
     logger.info("Bot iniciado")
