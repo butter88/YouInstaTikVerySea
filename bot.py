@@ -46,6 +46,8 @@ ANY_SUPPORTED_URL = re.compile(
 
 MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
+SHARE_GOOGLE_RE = re.compile(r"https?://share\.google/\S+")
+
 # --- Instagram cookies setup ---
 _INSTAGRAM_COOKIES_PATH = None
 
@@ -575,12 +577,84 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             os.rmdir(tmp_dir)
 
 
+def _resolve_share_google(share_url: str) -> str | None:
+    """Follow share.google redirect(s) to get the final real URL."""
+    try:
+        req = urllib.request.Request(
+            share_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        final_url = resp.url
+        resp.close()
+        if final_url and final_url != share_url:
+            return final_url
+    except Exception as e:
+        logger.warning("Failed to resolve share.google URL: %s", e)
+    return None
+
+
+async def _handle_share_google(update: Update, share_url: str, original_text: str) -> None:
+    """Replace share.google link with the real URL, repost crediting the user."""
+    user = update.message.from_user
+    real_url = await asyncio.to_thread(_resolve_share_google, share_url)
+
+    if not real_url:
+        logger.warning("Could not resolve share.google link: %s", share_url)
+        return  # Don't touch the message if we can't resolve it
+
+    # Build the new text with the real URL
+    new_text = original_text.replace(share_url, real_url)
+
+    # Credit the original user
+    if user.username:
+        credit = f"@{user.username}"
+    else:
+        credit = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+
+    new_message = f"{new_text}\n\n— Compartido por {credit}"
+
+    # Try to delete the original message (needs admin permissions)
+    try:
+        await update.message.delete()
+    except Exception as e:
+        logger.warning("Could not delete original message: %s", e)
+        # If we can't delete, just reply instead of reposting
+        await update.message.reply_text(
+            f"Enlace real: {real_url}",
+            disable_web_page_preview=False,
+        )
+        return
+
+    # Send the new message with the real URL
+    await update.message.chat.send_message(
+        text=new_message,
+        parse_mode="HTML",
+        disable_web_page_preview=False,
+    )
+
+
 async def auto_detect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-detect TikTok/Instagram/YouTube links and reply with the video."""
+    """Auto-detect supported links and share.google URLs."""
     if not update.message or not update.message.text:
         return
 
-    url = extract_supported_url(update.message.text)
+    text = update.message.text
+
+    # --- Handle share.google links ---
+    share_match = SHARE_GOOGLE_RE.search(text)
+    if share_match:
+        await _handle_share_google(update, share_match.group(0), text)
+        return
+
+    # --- Handle video links ---
+    url = extract_supported_url(text)
     if not url:
         return
 
