@@ -4,7 +4,6 @@ import json
 import logging
 import tempfile
 import asyncio
-import base64
 import subprocess
 import urllib.request
 import urllib.parse
@@ -48,56 +47,7 @@ MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 SHARE_GOOGLE_RE = re.compile(r"https?://share\.google/\S+")
 
-# --- Instagram cookies setup ---
-_INSTAGRAM_COOKIES_PATH = None
-
-
-def _setup_instagram_cookies() -> str | None:
-    """Build a Netscape cookies file from individual Instagram cookie env vars.
-
-    Required env vars (get from browser DevTools > Application > Cookies > instagram.com):
-      - IG_SESSIONID   → sessionid cookie
-      - IG_DS_USER_ID  → ds_user_id cookie
-      - IG_CSRFTOKEN   → csrftoken cookie
-
-    Alternatively, supports legacy INSTAGRAM_COOKIES (small base64/plain text).
-    """
-    sessionid = os.getenv("IG_SESSIONID", "").strip()
-    ds_user_id = os.getenv("IG_DS_USER_ID", "").strip()
-    csrftoken = os.getenv("IG_CSRFTOKEN", "").strip()
-
-    if sessionid and ds_user_id:
-        # Build minimal Netscape format cookies file
-        lines = [
-            "# Netscape HTTP Cookie File",
-            f".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t{sessionid}",
-            f".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t{ds_user_id}",
-        ]
-        if csrftoken:
-            lines.append(f".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\t{csrftoken}")
-        content = "\n".join(lines) + "\n"
-        logger.info("Instagram cookies built from IG_SESSIONID + IG_DS_USER_ID env vars")
-    else:
-        # Fallback: try INSTAGRAM_COOKIES env var (small files only)
-        raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
-        if not raw:
-            return None
-        try:
-            content = base64.b64decode(raw).decode("utf-8")
-        except Exception:
-            content = raw
-
-    try:
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", prefix="ig_cookies_", delete=False
-        )
-        tmp.write(content)
-        tmp.close()
-        logger.info("Instagram cookies loaded (%d bytes)", len(content))
-        return tmp.name
-    except Exception as e:
-        logger.error("Failed to setup Instagram cookies: %s", e)
-        return None
+FORWARD_TARGET = os.getenv("FORWARD_TARGET", "@butter88")
 
 
 def extract_supported_url(text: str) -> str | None:
@@ -117,6 +67,31 @@ def _is_tiktok(url: str) -> bool:
 
 def _is_instagram(url: str) -> bool:
     return "instagram.com" in url
+
+
+def _is_twitter(url: str) -> bool:
+    return "twitter.com" in url or "x.com" in url
+
+
+def _twitter_has_video(url: str) -> bool:
+    """Probe a Twitter/X URL to check if it contains a downloadable video."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return False
+            formats = info.get("formats", [])
+            return any(
+                f.get("vcodec") not in (None, "none", "")
+                for f in formats
+            )
+    except Exception:
+        return False
 
 
 def _download_with_ytdlp(url: str, output_path: str) -> dict | None:
@@ -140,13 +115,6 @@ def _download_with_ytdlp(url: str, output_path: str) -> dict | None:
         },
         "extractor_args": {"tiktok": {"api_hostname": ["api22-normal-c-alisg.tiktokv.com"]}},
     }
-
-    # Pass Instagram cookies if available
-    if _is_instagram(url) and _INSTAGRAM_COOKIES_PATH:
-        ydl_opts["cookiefile"] = _INSTAGRAM_COOKIES_PATH
-        logger.info("Using Instagram cookies file for yt-dlp")
-    elif _is_instagram(url):
-        logger.warning("No Instagram cookies available - download may fail")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -267,159 +235,88 @@ def _download_tiktok_fallback(url: str, output_path: str) -> dict | None:
     return {"title": video_data.get("title", "")}
 
 
-def _shortcode_to_media_id(shortcode: str) -> int:
-    """Convert Instagram shortcode to numeric media ID."""
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-    media_id = 0
-    for char in shortcode:
-        media_id = media_id * 64 + alphabet.index(char)
-    return media_id
-
-
-def _download_instagram_fallback(url: str, output_path: str) -> dict | None:
-    """Fallback for Instagram using direct API with session cookies.
-    Supports videos, single images, and carousels.
-    Returns dict with 'title', and optionally 'image_urls' for photo posts.
-    """
+def _download_instagram_embed(url: str, output_path: str) -> dict | None:
+    """Download Instagram content via the public embed page (no credentials needed)."""
     match = re.search(r"instagram\.com/(?:reel|p|stories)/([A-Za-z0-9_-]+)", url)
     if not match:
-        logger.error("Could not extract Instagram shortcode from URL")
         return None
-
     shortcode = match.group(1)
 
-    sessionid = os.getenv("IG_SESSIONID", "").strip()
-    ds_user_id = os.getenv("IG_DS_USER_ID", "").strip()
-    csrftoken = os.getenv("IG_CSRFTOKEN", "").strip()
-
-    if not sessionid or not ds_user_id:
-        logger.error("Instagram fallback requires IG_SESSIONID and IG_DS_USER_ID env vars")
-        return None
-
-    cookie_str = f"sessionid={sessionid}; ds_user_id={ds_user_id}"
-    if csrftoken:
-        cookie_str += f"; csrftoken={csrftoken}"
-
+    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
     headers = {
-        "User-Agent": "Instagram 275.0.0.27.98 Android",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cookie": cookie_str,
-        "X-IG-App-ID": "936619743392459",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Sec-Fetch-Mode": "navigate",
     }
-    if csrftoken:
-        headers["X-CSRFToken"] = csrftoken
+
+    try:
+        req = urllib.request.Request(embed_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.warning("Instagram embed fetch failed: %s", e)
+        return None
 
     video_url = None
-    image_urls = []
-    title = ""
+    image_url = None
 
-    # --- Method 1: Instagram mobile API (i.instagram.com) ---
-    try:
-        media_id = _shortcode_to_media_id(shortcode)
-        api_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
-        logger.info("Instagram fallback: trying mobile API for media %s", media_id)
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+    # Look for video URL in the embed page HTML/JSON
+    for pattern in [
+        r'"video_url"\s*:\s*"([^"]+)"',
+        r'"src"\s*:\s*"(https://[^"]+\.mp4[^"]*)',
+    ]:
+        m = re.search(pattern, html)
+        if m:
+            video_url = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+            break
 
-        items = data.get("items", [])
-        if items:
-            item = items[0]
-            # Get caption
-            caption = item.get("caption")
-            if caption and isinstance(caption, dict):
-                title = caption.get("text", "")
-
-            # Check for carousel
-            carousel = item.get("carousel_media", [])
-            if carousel:
-                logger.info("Instagram fallback: detected carousel with %d items", len(carousel))
-                for slide in carousel:
-                    # Each slide can be video or image
-                    vid_versions = slide.get("video_versions", [])
-                    if vid_versions:
-                        image_urls.append(vid_versions[0]["url"])
-                    else:
-                        # Get best quality image
-                        candidates = slide.get("image_versions2", {}).get("candidates", [])
-                        if candidates:
-                            image_urls.append(candidates[0]["url"])
-            else:
-                # Single post - check video first, then image
-                versions = item.get("video_versions", [])
-                if versions:
-                    video_url = versions[0].get("url")
-                else:
-                    candidates = item.get("image_versions2", {}).get("candidates", [])
-                    if candidates:
-                        image_urls.append(candidates[0]["url"])
-    except Exception as e:
-        logger.warning("Instagram mobile API failed: %s", e)
-
-    # --- Method 2: page scrape (for video only) ---
-    if not video_url and not image_urls:
-        try:
-            page_url = f"https://www.instagram.com/p/{shortcode}/"
-            logger.info("Instagram fallback: trying page scrape")
-            web_headers = dict(headers)
-            web_headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
-            req3 = urllib.request.Request(page_url, headers=web_headers)
-            with urllib.request.urlopen(req3, timeout=30) as resp3:
-                html = resp3.read().decode("utf-8", errors="replace")
-
-            # Try video patterns
-            for pattern in [
-                r'"video_url"\s*:\s*"([^"]+)"',
-                r'"contentUrl"\s*:\s*"([^"]+)"',
-                r'<meta\s+property="og:video"\s+content="([^"]+)"',
-            ]:
-                vid_match = re.search(pattern, html)
-                if vid_match:
-                    video_url = vid_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
-                    logger.info("Instagram fallback: found video URL via page scrape")
-                    break
-
-            # If no video, try og:image as last resort
-            if not video_url:
-                img_match = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
-                if img_match:
-                    image_urls.append(img_match.group(1).replace("\\u0026", "&").replace("\\/", "/"))
-                    logger.info("Instagram fallback: found image URL via og:image")
-        except Exception as e:
-            logger.warning("Instagram page scrape failed: %s", e)
-
-    # --- Return images (carousel/single photo) ---
-    if image_urls and not video_url:
-        logger.info("Instagram fallback: returning %d image(s)", len(image_urls))
-        return {"title": title or f"Instagram {shortcode}", "image_urls": image_urls}
-
-    # --- Download video ---
     if not video_url:
-        logger.error("Instagram: no media found for %s", shortcode)
+        m = re.search(r'<video[^>]+src="([^"]+)"', html)
+        if m:
+            video_url = m.group(1).replace("&amp;", "&")
+
+    if not video_url:
+        for pattern in [
+            r'"display_url"\s*:\s*"([^"]+)"',
+            r'<img[^>]+class="[^"]*EmbeddedMedia[^"]*"[^>]+src="([^"]+)"',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                image_url = m.group(1).replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+                break
+
+    if not video_url and not image_url:
+        logger.warning("Instagram embed: no media found for shortcode %s", shortcode)
         return None
 
-    logger.info("Instagram fallback: downloading video...")
-    vid_req = urllib.request.Request(
-        video_url,
-        headers={
-            "User-Agent": headers["User-Agent"],
-            "Cookie": cookie_str,
-        },
-    )
-    with urllib.request.urlopen(vid_req, timeout=60) as vid_resp:
-        with open(output_path, "wb") as f:
-            while True:
-                chunk = vid_resp.read(1024 * 64)
-                if not chunk:
-                    break
-                f.write(chunk)
+    if image_url and not video_url:
+        return {"title": f"Instagram {shortcode}", "image_urls": [image_url]}
 
-    return {"title": title or f"Instagram {shortcode}"}
+    # Download the video
+    try:
+        vid_req = urllib.request.Request(
+            video_url,
+            headers={
+                "User-Agent": headers["User-Agent"],
+                "Referer": "https://www.instagram.com/",
+            },
+        )
+        with urllib.request.urlopen(vid_req, timeout=60) as vid_resp:
+            with open(output_path, "wb") as f:
+                while True:
+                    chunk = vid_resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        return {"title": f"Instagram {shortcode}"}
+    except Exception as e:
+        logger.warning("Instagram embed video download failed: %s", e)
+        return None
 
 
 def download_video(url: str, output_path: str) -> dict | None:
@@ -439,14 +336,14 @@ def download_video(url: str, output_path: str) -> dict | None:
         except Exception as e:
             logger.error("TikTok fallback also failed: %s", e)
 
-    # --- Attempt 3: Instagram-specific fallback ---
+    # --- Attempt 3: Instagram-specific fallback (public embed, no credentials) ---
     if _is_instagram(url):
         try:
-            result = _download_instagram_fallback(url, output_path)
+            result = _download_instagram_embed(url, output_path)
             if result:
                 return result
         except Exception as e:
-            logger.error("Instagram fallback also failed: %s", e)
+            logger.error("Instagram embed fallback also failed: %s", e)
 
     return None
 
@@ -624,10 +521,10 @@ async def _handle_share_google(update: Update, share_url: str, original_text: st
     try:
         await update.message.delete()
     except Exception as e:
-        logger.warning("Could not delete original message: %s", e)
+        logger.warning("Could not delete original message (bot needs 'Delete messages' admin permission): %s", e)
         # If we can't delete, just reply instead of reposting
         await update.message.reply_text(
-            f"Enlace real: {real_url}",
+            f"🔗 Enlace real: {real_url}",
             disable_web_page_preview=False,
         )
         return
@@ -657,6 +554,12 @@ async def auto_detect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     url = extract_supported_url(text)
     if not url:
         return
+
+    # For Twitter/X: silently skip if the tweet contains no downloadable video
+    if _is_twitter(url):
+        has_video = await asyncio.to_thread(_twitter_has_video, url)
+        if not has_video:
+            return
 
     status_msg = await update.message.reply_text("Descargando video...")
 
@@ -693,10 +596,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def main() -> None:
-    global _INSTAGRAM_COOKIES_PATH
-    _INSTAGRAM_COOKIES_PATH = _setup_instagram_cookies()
+async def _silent_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Copy every group text message to FORWARD_TARGET without any trace in the group."""
+    if not update.message or not update.message.text:
+        return
+    user = update.message.from_user
+    chat = update.message.chat
+    if not user:
+        return
+    sender = f"@{user.username}" if user.username else (user.first_name or f"id:{user.id}")
+    group_name = chat.title or chat.username or str(chat.id)
+    try:
+        await context.bot.send_message(
+            chat_id=FORWARD_TARGET,
+            text=f"[{group_name}] {sender}: {update.message.text}",
+        )
+    except Exception as e:
+        logger.debug("Silent forward error: %s", e)
 
+
+def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en .env")
@@ -707,13 +626,18 @@ def main() -> None:
     app.add_handler(CommandHandler("video", cmd_video))
     # Auto-detect TikTok/Instagram/YouTube/Twitter links in any text message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect))
+    # Silent copy of all text messages to the target account (group 1 = runs independently)
+    app.add_handler(MessageHandler(filters.TEXT, _silent_forward), group=1)
 
     logger.info("Bot iniciado")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
